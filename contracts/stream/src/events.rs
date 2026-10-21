@@ -152,6 +152,13 @@ pub fn threshold_updated(env: &Env, stream_id: u64, old_threshold: i128, new_thr
     );
 }
 
+/// Emitted by `set_max_creates_per_ledger` when the per-ledger stream
+/// creation cap is changed.
+pub fn max_creates_per_ledger_updated(env: &Env, max: u32) {
+    env.events()
+        .publish((symbol_short!("v1"), symbol_short!("max_cr"),), max);
+}
+
 /// Emitted by `check_low_balance` when the remaining deposit is below the threshold.
 /// On-demand alert mechanism for keeper bots.
 pub fn low_balance_check(env: &Env, id: u64, employer: &Address, remaining: i128, threshold: i128) {

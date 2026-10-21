@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::types::{
-    AutoTopupConfig, DataKey, PendingUpgrade, Stream, StreamParams, StreamStatus, ERR_ADMIN_NOT_SET, ERR_BAD_NONCE,
-    ERR_OVERFLOW, ERR_RATE_LIMIT_EXCEEDED, DEFAULT_MAX_CREATES_PER_LEDGER,
+    AutoTopupConfig, DataKey, DEFAULT_MAX_CREATES_PER_LEDGER, ERR_ADMIN_NOT_SET, ERR_BAD_NONCE,
+    ERR_OVERFLOW, ERR_RATE_LIMIT_EXCEEDED, LinearVestSchedule, PendingUpgrade, ProtocolFeeConfig,
+    Stream, StreamParams, StreamStatus, StreamType,
 };
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, Env, Vec};
 
 /// Minimum delay (in seconds) between proposing and executing an upgrade.
 /// Default: 172 800 s = 48 hours.
@@ -48,6 +49,94 @@ pub fn load_stream(env: &Env, id: u64) -> Option<Stream> {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
     stream
+}
+
+/// Load a stream by ID from persistent *or* temporary storage.
+///
+/// `archive_stream` moves closed streams into temporary storage, so read-only
+/// helpers that must still see archived streams use this function.
+pub fn load_stream_any(env: &Env, id: u64) -> Option<Stream> {
+    if let Some(stream) = load_stream(env, id) {
+        return Some(stream);
+    }
+    let key = DataKey::Stream(id);
+    env.storage().temporary().get(&key)
+}
+
+/// Record the timestamp at which a stream reached a terminal state.
+pub fn set_stream_ended_at(env: &Env, stream_id: u64, timestamp: u64) {
+    let key = DataKey::StreamEndedAt(stream_id);
+    env.storage().persistent().set(&key, &timestamp);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Return the timestamp at which a stream reached a terminal state, if any.
+pub fn get_stream_ended_at(env: &Env, stream_id: u64) -> Option<u64> {
+    let key = DataKey::StreamEndedAt(stream_id);
+    let ended_at: Option<u64> = env.storage().persistent().get(&key);
+    if ended_at.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+    ended_at
+}
+
+// ---------------------------------------------------------------------------
+// Stream creation rate limit (SEC-24)
+// ---------------------------------------------------------------------------
+
+/// Return the maximum number of streams an employer may create per ledger.
+pub fn get_max_creates_per_ledger(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxCreatesPerLedger)
+        .unwrap_or(DEFAULT_MAX_CREATES_PER_LEDGER)
+}
+
+/// Store the maximum number of streams an employer may create per ledger.
+pub fn store_max_creates(env: &Env, max: u32) {
+    env.storage().instance().set(&DataKey::MaxCreatesPerLedger, &max);
+}
+
+/// Count `count` new stream creations against the employer's per-ledger cap.
+///
+/// The counter lives in temporary storage and is keyed by the ledger sequence
+/// number, so the budget resets automatically on every new ledger. Batches are
+/// charged for every stream they create, so a single call cannot bypass the
+/// cap.
+///
+/// # Panics
+/// - E035 if the employer's creations in this ledger would exceed the cap.
+pub fn check_and_increment_create_rate(env: &Env, employer: &Address, count: u32) {
+    let current_ledger = env.ledger().sequence();
+    let max = get_max_creates_per_ledger(env);
+
+    let last_ledger: u32 = env
+        .storage()
+        .temporary()
+        .get(&DataKey::LastCreateLedger(employer.clone()))
+        .unwrap_or(0);
+    let created: u32 = env
+        .storage()
+        .temporary()
+        .get(&DataKey::CreateCountThisLedger(employer.clone()))
+        .unwrap_or(0);
+
+    // A new ledger resets the per-ledger budget.
+    let created_in_ledger = if last_ledger == current_ledger { created } else { 0 };
+    let updated = created_in_ledger + count;
+
+    assert!(updated <= max, "{}", ERR_RATE_LIMIT_EXCEEDED);
+
+    env.storage()
+        .temporary()
+        .set(&DataKey::LastCreateLedger(employer.clone()), &current_ledger);
+    env.storage()
+        .temporary()
+        .set(&DataKey::CreateCountThisLedger(employer.clone()), &updated);
 }
 
 /// Allocate and persist the next sequential stream ID.

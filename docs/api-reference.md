@@ -425,7 +425,7 @@ Employee withdraws all claimable tokens from every stream they receive in a sing
 |---|---|---|
 | `employee` | `Address` | Employee address (requires auth, checked once) |
 
-**Returns:** `Vec<i128>` — amounts transferred in employee stream-index order, with one entry per stream that paid out; empty if nothing was claimable
+**Returns:** `Vec<(u64, i128)>` — `(stream_id, amount)` pairs in employee stream-index order, with one entry per stream that paid out; empty if nothing was claimable
 
 **Errors:**
 - Panics if contract is paused
@@ -870,6 +870,48 @@ Read the full state of up to 50 streams in a single call. Lets off-chain dashboa
 ```bash
 stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
   -- get_streams_batch --stream_ids '[1, 2, 3]'
+```
+
+---
+
+### `get_streams_by_status`
+
+Return the IDs of an employer's streams that currently have a given status. Dashboards use this to
+show, for example, only the Active streams of an employer instead of calling `get_streams_batch`
+and filtering the result client-side. Read-only: no authorization is required.
+
+The result is capped at 50 entries. Use `offset` to page through larger portfolios — `offset`
+counts the matching streams that are skipped before the returned page starts. Archived streams
+(moved to temporary storage by `archive_stream`) are still reported.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employer` | `Address` | Employer address to query |
+| `status` | `StreamStatus` | Status the streams must currently have (`Active`, `Paused`, `Cancelled`, `Exhausted`) |
+| `offset` | `u32` | Number of matching streams to skip before the page starts |
+
+**Returns:** `Vec<u64>` — stream IDs in creation order; empty when the employer has no stream with
+that status
+
+**Errors:** none — an employer without matching streams yields an empty vector
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_streams_by_status --employer <EMPLOYER_ADDRESS> --status Active --offset 0
+```
+
+**Pagination example:** an employer with 120 Active streams is read in three calls:
+
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_streams_by_status --employer <EMPLOYER_ADDRESS> --status Active --offset 0   # 50 IDs
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_streams_by_status --employer <EMPLOYER_ADDRESS> --status Active --offset 50  # 50 IDs
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_streams_by_status --employer <EMPLOYER_ADDRESS> --status Active --offset 100 # 20 IDs
 ```
 
 ---
@@ -1739,6 +1781,15 @@ Keep this table in sync with that file (see [CONTRIBUTING.md](../CONTRIBUTING.md
 | E009 | `ERR_BAD_NONCE` | Invalid admin nonce | `propose_admin`, `pause_contract`, `unpause_contract`, `set_min_deposit`, `set_protocol_fee`, `upgrade`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` | Read the current value with `admin_nonce` and pass it as `nonce` |
 | E029 | `ERR_BATCH_TOO_LARGE` | Batch contains more than 50 streams | `create_streams_batch`, `cancel_streams_batch` | Split the operation into batches of at most 50 streams |
 | E030 | `ERR_INVALID_STOP_TIME` | Nonzero stop time precedes last withdrawal | `update_stop_time` | Use 0 or a timestamp at/after `last_withdraw_time` |
+| E025 | `ERR_INVALID_AUTO_TOPUP` | Invalid auto top-up parameters | `set_auto_topup` | Ensure `0 < topup_amount <= max_total` and `trigger_threshold > 0` |
+| E026 | `ERR_NO_AUTO_TOPUP` | No auto top-up configured for the stream | `cancel_auto_topup` | Call `set_auto_topup` first |
+| E032 | `ERR_STREAM_NOT_ENDED` | Stream is neither Cancelled nor Exhausted | `archive_stream` | Close the stream before archiving it |
+| E033 | `ERR_ARCHIVE_TOO_EARLY` | Archive waiting period has not elapsed | `archive_stream` | Wait 30 days after the stream ended |
+| E034 | `ERR_UPGRADE_TIMELOCK_ACTIVE` | Upgrade time-lock has not expired | `execute_upgrade` | Wait 48 hours after `propose_upgrade` |
+| E035 | `ERR_RATE_LIMIT_EXCEEDED` | Employer exceeded the per-ledger stream creation limit | `create_stream`, `create_streams_batch` | Retry in a later ledger or raise the cap with `set_max_creates_per_ledger` |
+| E037 | `ERR_SPLIT_TOO_FEW` | Split stream has fewer than two beneficiaries | `create_split_stream` | Provide at least two beneficiaries |
+| E038 | `ERR_SPLIT_TOO_MANY` | Split stream has more than 20 beneficiaries | `create_split_stream` | Provide at most 20 beneficiaries |
+| E039 | `ERR_SPLIT_BASIS_INVALID` | Beneficiary basis points do not sum to 10000 | `create_split_stream` | Make the allocations sum to exactly 100% |
 | T001 | `ERR_OVERFLOW` (token) | Token arithmetic overflow | Token `mint`, `transfer`, `transfer_from` | Use smaller amounts |
 
 ---

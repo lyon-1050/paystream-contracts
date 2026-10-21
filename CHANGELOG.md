@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SC-46: `get_streams_by_status(employer, status, offset) -> Vec<u64>` — read-only batch query that
+  returns the IDs of an employer's streams with a given status (`Active`, `Paused`, `Cancelled`,
+  `Exhausted`). Capped at 50 results; use `offset` to page through larger portfolios. Lets
+  dashboards filter a portfolio server-side instead of fetching and filtering every stream
+  client-side.
+- SEC-33: defence-in-depth post-condition assertions in `withdraw` (`withdrawn <= deposit`,
+  `!locked`) and `cancel_stream` (`claimable_paid + refund == total_remaining`). The assertions use
+  `debug_assert!`, so they compile out of release WASM builds and cost no gas on-chain.
+- TEST-36: chaos test that runs 500 deterministic random sequences of interleaved
+  `create` / `top_up` / `withdraw` / `pause` / `resume` / `update_rate` / `cancel` operations and
+  checks the stream accounting invariants after every step. Runs as part of `cargo test` in CI.
+  A failing sequence is shrunk down to a minimal reproduction.
+- OPS-26: `reproducible-build.yml` CI job that builds the WASM contracts twice from a clean target
+  directory and compares the SHA256 hashes of both builds, failing with a diagnostic when they
+  differ. The result is written to the GitHub Actions job summary.
 - Canonical read-only stream index entrypoints `stream_ids_by_employer` and `stream_ids_by_employee`; the former `streams_by_*` entrypoints remain as deprecated aliases.
 - SC-06: `stream_status(stream_id) -> StreamStatus` — lightweight view that returns only
   the stream status without loading the full `Stream` struct into the caller's response.

@@ -1,0 +1,153 @@
+name: Reproducible Build
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deterministic builds: no incremental compilation, no interference from an
+  # ambient RUSTFLAGS between the two builds.
+  CARGO_INCREMENTAL: 0
+  WASM_TARGET: wasm32-unknown-unknown
+
+jobs:
+  reproducible-wasm:
+    name: Reproducible WASM build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: |
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            echo "::error::rust-toolchain.toml does not pin a channel"
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Pinned channel from rust-toolchain.toml: $channel"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Verify the pinned toolchain is in effect
+        run: |
+          expected="${{ steps.toolchain.outputs.channel }}"
+          actual=$(rustc --version)
+          echo "rust-toolchain.toml pins: $expected"
+          echo "toolchain in use:          $actual"
+          case "$actual" in
+            "$expected"*) ;;
+            stable*|beta*|nightly*)
+              echo "::warning::rust-toolchain.toml pins the '$expected' channel, not an exact version — the channel moves over time, so byte-for-byte reproducibility across releases additionally requires an exact version pin."
+              ;;
+            *)
+              echo "::error::the toolchain in use ($actual) does not match the pinned channel ($expected)"
+              exit 1
+              ;;
+          esac
+
+      - name: Build WASM (build #1)
+        run: |
+          rm -rf target
+          cargo build --locked --release --target "$WASM_TARGET" \
+            -p paystream-stream -p paystream-token
+          mkdir -p "$RUNNER_TEMP/build-1"
+          cp target/"$WASM_TARGET"/release/*.wasm "$RUNNER_TEMP/build-1/"
+          ls -l "$RUNNER_TEMP/build-1"
+
+      - name: Build WASM (build #2, clean target directory)
+        run: |
+          # A clean target directory guarantees that the second build is
+          # produced from scratch, not from cached incremental artefacts.
+          rm -rf target
+          cargo build --locked --release --target "$WASM_TARGET" \
+            -p paystream-stream -p paystream-token
+          mkdir -p "$RUNNER_TEMP/build-2"
+          cp target/"$WASM_TARGET"/release/*.wasm "$RUNNER_TEMP/build-2/"
+          ls -l "$RUNNER_TEMP/build-2"
+
+      - name: Compare SHA256 hashes
+        env:
+          BUILD_ONE: ${{ runner.temp }}/build-1
+          BUILD_TWO: ${{ runner.temp }}/build-2
+        run: |
+          set -uo pipefail
+          status=0
+          summary="$GITHUB_STEP_SUMMARY"
+          diff_file="$RUNNER_TEMP/hash-diff.txt"
+          : > "$diff_file"
+
+          {
+            echo "### Reproducible WASM build (OPS-26)"
+            echo ""
+            echo "- Toolchain: \`$(rustc --version)\` (pinned via \`rust-toolchain.toml\`)"
+            echo "- Target: \`$WASM_TARGET\`, profile: \`release\`, \`--locked\` dependencies"
+            echo "- Method: two clean builds of the same commit, SHA256 compared"
+            echo ""
+            echo "| Artifact | SHA256 (build #1) | SHA256 (build #2) | Reproducible |"
+            echo "|---|---|---|---|"
+          } >> "$summary"
+
+          shopt -s nullglob
+          artifacts=("$BUILD_ONE"/*.wasm)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "::error::no WASM artifact was produced by the build"
+            echo "No WASM artifact was produced by the build." >> "$summary"
+            exit 1
+          fi
+
+          for artifact in "${artifacts[@]}"; do
+            name="$(basename "$artifact")"
+            if [ ! -f "$BUILD_TWO/$name" ]; then
+              status=1
+              echo "::error file=$artifact::$name is missing from the second build"
+              echo "$name: missing from build #2" >> "$diff_file"
+              continue
+            fi
+            hash_one=$(sha256sum "$artifact" | cut -d' ' -f1)
+            hash_two=$(sha256sum "$BUILD_TWO/$name" | cut -d' ' -f1)
+            if [ "$hash_one" = "$hash_two" ]; then
+              echo "| $name | \`$hash_one\` | \`$hash_two\` | ✅ yes |" >> "$summary"
+            else
+              status=1
+              echo "| $name | \`$hash_one\` | \`$hash_two\` | ❌ no |" >> "$summary"
+              echo "::error file=$artifact::$name is not reproducible — build #1 sha256=$hash_one, build #2 sha256=$hash_two"
+              {
+                echo "artifact: $name"
+                echo "  build #1: $hash_one"
+                echo "  build #2: $hash_two"
+                echo "  first differing bytes:"
+                cmp -l "$artifact" "$BUILD_TWO/$name" | head -20 || true
+              } >> "$diff_file"
+            fi
+          done
+
+          echo "" >> "$summary"
+          if [ "$status" -eq 0 ]; then
+            echo "✅ All WASM artifacts are byte-for-byte reproducible." >> "$summary"
+          else
+            echo "❌ The WASM build is **not** reproducible." >> "$summary"
+            echo "" >> "$summary"
+            echo "<details><summary>Diagnostics</summary>" >> "$summary"
+            echo "" >> "$summary"
+            echo '```' >> "$summary"
+            cat "$diff_file" >> "$summary"
+            echo '```' >> "$summary"
+            echo "" >> "$summary"
+            echo "</details>" >> "$summary"
+          fi
+
+          exit "$status"

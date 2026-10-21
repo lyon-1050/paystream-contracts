@@ -111,13 +111,18 @@ pub struct AutoTopupConfig {
     pub total_topped_up: i128,
 }
 
-/// Configuration for recurring stream auto top-up.
+/// Protocol fee charged on every stream creation.
 ///
-/// Re-exported here because `lib.rs` imports `AutoTopupConfig` from `types`.
-/// The canonical definition lives in this module.
-// NOTE: This re-declaration is intentional — the original definition at line ~63
-// was not imported by lib.rs because the types import list did not include it.
-// Alias removed; the struct already exists above.
+/// The fee is deducted from the gross deposit before the net amount is locked
+/// in escrow; the fee itself is transferred to `treasury` at creation time.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolFeeConfig {
+    /// Fee in basis points (100 bps = 1%). Must not exceed 100.
+    pub fee_bps: u16,
+    /// Address that receives the protocol fee.
+    pub treasury: Address,
+}
 
 /// Pending upgrade proposal for the time-lock upgrade mechanism (SEC-02).
 #[contracttype]
@@ -173,6 +178,23 @@ pub enum DataKey {
     TemplateIds(Address),
     /// Saved stream templates: (employer address, template ID) → StreamParams.
     Template(Address, u32),
+    /// Stream type discriminator: stream ID → StreamType.
+    ///
+    /// New variants must be appended to the end of this enum: `contracttype`
+    /// encodes enum variants by position, so inserting a variant in the middle
+    /// would change the encoding of every variant that follows it.
+    StreamType(u64),
+    /// Linear vest terms: stream ID → LinearVestSchedule.
+    LinearVestSchedule(u64),
+    /// Timestamp at which a stream reached a terminal state (Cancelled or
+    /// Exhausted). Used by `archive_stream` to enforce the waiting period.
+    StreamEndedAt(u64),
+    /// Maximum number of streams a single employer may create per ledger.
+    MaxCreatesPerLedger,
+    /// Ledger sequence number in which the employer last created a stream.
+    LastCreateLedger(Address),
+    /// Number of streams the employer created in the current ledger.
+    CreateCountThisLedger(Address),
 }
 
 /// Contract error codes – panic messages reference these names so callers can
@@ -264,6 +286,20 @@ pub const ERR_NO_PENDING_DRAIN: &str = "E027: no pending emergency drain proposa
 pub const ERR_NEW_EMPLOYER_IS_EMPLOYEE: &str = "E028: new_employer must differ from the stream employee";
 /// Error returned when a batch exceeds the maximum size.
 pub const ERR_BATCH_TOO_LARGE: &str = "E029: batch exceeds the maximum of 50 streams";
+/// E025: the auto top-up parameters are invalid.
+pub const ERR_INVALID_AUTO_TOPUP: &str = "E025: invalid auto top-up parameters";
+/// E026: no auto top-up is configured for the stream.
+pub const ERR_NO_AUTO_TOPUP: &str = "E026: no auto top-up configured for the stream";
+/// E030: the requested stop time precedes the stream's accrual baseline.
+pub const ERR_INVALID_STOP_TIME: &str = "E030: invalid stop time";
+/// E037: a split stream must have at least two beneficiaries.
+pub const ERR_SPLIT_TOO_FEW: &str = "E037: split stream requires at least two beneficiaries";
+/// E038: a split stream may not have more than 20 beneficiaries.
+pub const ERR_SPLIT_TOO_MANY: &str = "E038: split stream supports at most 20 beneficiaries";
+/// E039: the beneficiary basis points must sum to exactly 10000.
+pub const ERR_SPLIT_BASIS_INVALID: &str = "E039: beneficiary basis points must sum to 10000";
+/// Maximum number of beneficiaries a split stream may have.
+pub const MAX_SPLIT_BENEFICIARIES: u32 = 20;
 /// E030: caller does not hold the stream receipt.
 pub const ERR_NOT_RECEIPT_OWNER: &str = "E030: caller does not hold the stream receipt";
 /// E031: template not found.
@@ -275,3 +311,24 @@ pub const ERR_STOP_TIME_TOO_FAR: &str = "E030: stop_time must not exceed 10 year
 
 /// Maximum stop_time window: 10 years in seconds (315,360,000 seconds)
 pub const MAX_STOP_TIME_OFFSET: u64 = 315_360_000;
+
+/// E032: the stream is neither Cancelled nor Exhausted and cannot be archived.
+pub const ERR_STREAM_NOT_ENDED: &str = "E032: stream is not ended";
+
+/// E033: the archive waiting period has not elapsed yet.
+pub const ERR_ARCHIVE_TOO_EARLY: &str = "E033: stream cannot be archived yet";
+
+/// E034: the upgrade time-lock has not expired yet.
+pub const ERR_UPGRADE_TIMELOCK_ACTIVE: &str = "E034: upgrade timelock is still active";
+
+/// E035: the employer exceeded the per-ledger stream creation limit (SEC-24).
+pub const ERR_RATE_LIMIT_EXCEEDED: &str = "E035: stream creation rate limit exceeded";
+
+/// Default maximum number of streams one employer may create per ledger.
+pub const DEFAULT_MAX_CREATES_PER_LEDGER: u32 = 50;
+
+/// Maximum number of results returned by paginated query helpers.
+///
+/// Mirrors [`MAX_BATCH_SIZE`] so that a single contract invocation never
+/// returns more than 50 entries regardless of the helper used.
+pub const MAX_QUERY_RESULTS: u32 = 50;

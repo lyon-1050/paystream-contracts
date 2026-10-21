@@ -12,6 +12,8 @@ pub mod utils;
 pub mod validate;
 
 #[cfg(test)]
+mod chaos;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Map, Vec};
@@ -21,31 +23,35 @@ use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Map, Vec}
 /// storage and `version()` can be queried off-chain.
 pub const CONTRACT_VERSION: u32 = 1;
 use storage::{
-    claimable_amount, clear_pending_admin, clear_pending_upgrade, consume_admin_nonce, get_admin,
-    get_admin_nonce, get_auto_topup, get_min_deposit, get_pending_admin, get_pending_admin_nonce,
-    get_pending_upgrade, get_streams_in_range, get_streams_in_time_range,
-    index_employee_stream, index_employer_stream, index_stream_by_timestamp, load_stream, next_id,
-    remove_auto_topup, save_stream, set_admin, set_auto_topup, set_min_deposit, set_pending_admin,
-    set_pending_admin_nonce, set_pending_upgrade, stream_ids_by_employee, stream_ids_by_employer,
-    TIMELOCK_DELAY,
-    get_admin_nonce, get_auto_topup, get_employee_streams, get_employer_streams, get_min_deposit,
-    get_pending_admin, get_pending_admin_nonce, get_pending_upgrade, get_streams_in_range, get_token_streams,
-    index_employee_stream, index_employer_stream, index_stream_by_timestamp, index_token_stream, load_stream, load_template, next_id,
-    receipt_owner, remove_auto_topup, remove_employer_stream, save_stream, save_template, set_admin, set_auto_topup, set_min_deposit, set_pending_admin,
-    set_pending_admin_nonce, set_pending_upgrade, set_receipt_owner, get_template_ids, TIMELOCK_DELAY,
+    check_and_increment_create_rate, claimable_amount, clear_pending_admin, clear_pending_upgrade,
+    consume_admin_nonce, get_admin, get_admin_nonce, get_auto_topup, get_linear_vest_schedule,
+    get_min_deposit, get_pending_admin, get_pending_admin_nonce, get_pending_upgrade,
+    get_protocol_fee, get_stream_ended_at, get_stream_type, get_streams_in_time_range,
+    get_template_ids, get_token_streams, index_employee_stream, index_employer_stream,
+    index_stream_by_timestamp, index_token_stream, linear_vest_claimable_amount, load_stream,
+    load_stream_any, load_template,
+    next_id, receipt_owner, remove_auto_topup, remove_employer_stream, save_stream, save_template,
+    set_admin, set_auto_topup, set_linear_vest_schedule, set_min_deposit, set_pending_admin,
+    set_pending_admin_nonce, set_pending_upgrade, set_protocol_fee, set_receipt_owner,
+    set_stream_ended_at, store_max_creates, stream_ids_by_employee, stream_ids_by_employer,
+    ARCHIVE_WAIT_PERIOD, GRACE_PERIOD, SECONDS_PER_DAY, TIMELOCK_DELAY,
 };
 use types::{
-    DataKey, LinearVestSchedule, Stream, StreamParams, StreamStatus, StreamType,
-    ERR_ADMIN_NOT_SET, ERR_BAD_PENDING_NONCE,
-    ERR_BATCH_TOO_LARGE, ERR_CONTRACT_PAUSED, ERR_EMPTY_PARAMS, ERR_NEW_EMPLOYER_IS_EMPLOYEE, ERR_NOT_ADMIN,
-    ERR_INVALID_STOP_TIME, ERR_NOT_EMPLOYEE, ERR_NOT_EMPLOYER, ERR_NOT_PENDING_ADMIN,
-    ERR_NO_PENDING_ADMIN, ERR_OVERFLOW,
+    AutoTopupConfig, DataKey, LinearVestSchedule, PendingUpgrade, SplitBeneficiary, Stream,
+    StreamParams, StreamStatus, StreamType,
+    ERR_ADMIN_NOT_SET, ERR_ARCHIVE_TOO_EARLY, ERR_BAD_PENDING_NONCE, ERR_BATCH_TOO_LARGE,
+    ERR_BELOW_MIN_DEPOSIT, ERR_CONTRACT_PAUSED, ERR_EMPTY_PARAMS, ERR_INVALID_AUTO_TOPUP,
+    ERR_INVALID_RATE, ERR_INVALID_STOP_TIME, ERR_NEW_EMPLOYER_IS_EMPLOYEE, ERR_NOT_ADMIN,
+    ERR_NOT_EMPLOYEE, ERR_NOT_EMPLOYER, ERR_NOT_PENDING_ADMIN, ERR_NOT_RECEIPT_OWNER,
+    ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_ADMIN, ERR_NO_PENDING_UPGRADE, ERR_OVERFLOW,
     ERR_REENTRANT, ERR_STREAM_ALREADY_ENDED, ERR_STREAM_CANCELLED, ERR_STREAM_EXHAUSTED,
-    ERR_STREAM_NOT_ACTIVE, ERR_STREAM_NOT_FOUND, ERR_STREAM_NOT_PAUSED, ERR_ZERO_DEPOSIT,
-    ERR_NOT_RECEIPT_OWNER, ERR_TEMPLATE_NOT_FOUND,
-    MAX_BATCH_SIZE,
+    ERR_STREAM_NOT_ACTIVE, ERR_STREAM_NOT_ENDED, ERR_STREAM_NOT_FOUND, ERR_STREAM_NOT_PAUSED,
+    ERR_STOP_TIME_PAST, ERR_TEMPLATE_NOT_FOUND, ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_DEPOSIT,
+    ERR_ZERO_RATE, MAX_BATCH_SIZE, MAX_QUERY_RESULTS,
 };
-use validate::{validate_create_stream, validate_rate, validate_split_beneficiaries, validate_top_up};
+use validate::{
+    validate_create_stream, validate_rate, validate_split_beneficiaries, validate_top_up,
+};
 
 fn get_paused(env: &Env) -> bool {
     env.storage()
@@ -276,6 +282,32 @@ impl StreamContract {
         assert!(max >= 1, "max must be at least 1");
         store_max_creates(&env, max);
         events::max_creates_per_ledger_updated(&env, max);
+    }
+
+    /// Admin configures the protocol fee charged on every stream creation.
+    ///
+    /// The fee is deducted from the gross deposit before the net amount is
+    /// locked in escrow; the fee itself is transferred to `treasury` when the
+    /// stream is created. `fee_bps` is capped at 100 (1%); setting it to 0
+    /// disables the fee.
+    ///
+    /// # Parameters
+    /// - `admin` — must be the stored admin (requires auth)
+    /// - `nonce` — current admin nonce (replay protection)
+    /// - `fee_bps` — fee in basis points (0 – 100)
+    /// - `treasury` — address that receives the collected fees
+    ///
+    /// # Errors
+    /// - Panics if `admin` auth fails or does not match the stored admin
+    /// - E009 if `nonce` does not match the stored admin nonce
+    /// - Panics if `fee_bps` exceeds 100
+    pub fn set_protocol_fee(env: Env, admin: Address, nonce: u64, fee_bps: u16, treasury: Address) {
+        admin.require_auth();
+        let stored_admin = get_admin(&env);
+        assert_eq!(admin, stored_admin, "{}", ERR_NOT_ADMIN);
+        consume_admin_nonce(&env, nonce);
+        assert!(fee_bps <= 100, "protocol fee cannot exceed 100 basis points");
+        set_protocol_fee(&env, fee_bps, &treasury);
     }
 
     /// Employer creates a salary stream and deposits funds into the contract escrow.
@@ -773,6 +805,30 @@ impl StreamContract {
 
         stream.locked = false;
         save_stream(&env, &stream);
+
+        // SEC-33: defence-in-depth post-conditions.
+        //
+        // These assertions are NOT the primary safety mechanism — the primary
+        // mechanism is the checked arithmetic and the `remaining` clamp inside
+        // `claimable_amount`. They exist to catch logic regressions (for
+        // example a future change that adds to `withdrawn` twice) at the exact
+        // point where the stream state is finalised, before the corruption can
+        // become exploitable.
+        //
+        // `debug_assert!` compiles out entirely in release WASM builds
+        // (`debug-assertions = false` in the release profile), so the checks
+        // cost no gas on-chain while still guarding every test and debug run.
+        debug_assert!(
+            stream.withdrawn <= stream.deposit,
+            "SEC-33: withdrawn ({}) must not exceed deposit ({})",
+            stream.withdrawn,
+            stream.deposit
+        );
+        debug_assert!(
+            !stream.locked,
+            "SEC-33: re-entrancy lock must be released after withdraw"
+        );
+
         events::withdrawn(&env, stream_id, &employee, amount);
         let remaining = stream.deposit - stream.withdrawn;
         if stream.low_balance_threshold > 0 && remaining < stream.low_balance_threshold {
@@ -799,22 +855,20 @@ impl StreamContract {
     /// - `employee` — employee address; must authenticate (requires auth, called once)
     ///
     /// # Returns
-    /// `Vec<i128>` — amounts transferred, in employee stream-index order,
-    /// with one entry for each stream from which tokens were transferred.
-    /// Empty if nothing was claimable.
+    /// `Vec<(u64, i128)>` — `(stream_id, amount)` pairs in employee
+    /// stream-index order, with one entry for each stream from which tokens
+    /// were transferred. Empty if nothing was claimable.
     ///
     /// # Errors
     /// - Panics if contract is paused
     /// - E003 if a reentrant withdraw is detected on any stream
-    pub fn withdraw_all(env: Env, employee: Address) -> Vec<i128> {
+    pub fn withdraw_all(env: Env, employee: Address) -> Vec<(u64, i128)> {
         employee.require_auth();
         assert!(!get_paused(&env), "contract is paused");
 
         let stream_ids = stream_ids_by_employee(&env, &employee);
-        let mut results: Vec<i128> = Vec::new(&env);
-        let stream_ids = get_employee_streams(&env, &employee);
         let mut results: Vec<(u64, i128)> = Vec::new(&env);
-        
+
         // Return empty results gracefully if employee has no streams
         if stream_ids.is_empty() {
             return results;
@@ -870,9 +924,22 @@ impl StreamContract {
 
             stream.locked = false;
             save_stream(&env, &stream);
+
+            // SEC-33: defence-in-depth post-conditions (see `withdraw`).
+            debug_assert!(
+                stream.withdrawn <= stream.deposit,
+                "SEC-33: withdrawn ({}) must not exceed deposit ({})",
+                stream.withdrawn,
+                stream.deposit
+            );
+            debug_assert!(
+                !stream.locked,
+                "SEC-33: re-entrancy lock must be released after withdraw"
+            );
+
             events::withdrawn(&env, stream_id, &employee, amount);
 
-            results.push_back(amount);
+            results.push_back((stream_id, amount));
         }
 
         results
@@ -1297,18 +1364,22 @@ impl StreamContract {
         );
 
         let now = env.ledger().timestamp();
-        let claimable = stream_claimable_amount(&env, &stream, now);
+        // SEC-33: amount still owed to the employee and the employer at the
+        // moment of cancellation, i.e. everything that has not been paid out
+        // yet. The cancellation must settle exactly this amount.
+        let total_remaining = stream.deposit - stream.withdrawn;
+        let claimable_paid = stream_claimable_amount(&env, &stream, now);
         let token_client = token::Client::new(&env, &stream.token);
 
-        if claimable > 0 {
+        if claimable_paid > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &receipt_owner(&env, &stream),
-                &claimable,
+                &claimable_paid,
             );
             stream.withdrawn = stream
                 .withdrawn
-                .checked_add(claimable)
+                .checked_add(claimable_paid)
                 .expect(ERR_OVERFLOW);
         }
 
@@ -1324,10 +1395,37 @@ impl StreamContract {
         set_stream_ended_at(&env, stream_id, now);
         stream.status = StreamStatus::Cancelled;
         save_stream(&env, &stream);
+
+        // SEC-33: defence-in-depth post-conditions.
+        //
+        // These assertions are NOT the primary safety mechanism — the primary
+        // mechanism is the checked arithmetic and the `remaining` clamp used to
+        // compute the claimable amount. They exist to catch logic regressions
+        // (for example a future change that refunds the employer twice) at the
+        // exact point where the settlement is finalised, before the corruption
+        // can become exploitable.
+        //
+        // `debug_assert!` compiles out entirely in release WASM builds
+        // (`debug-assertions = false` in the release profile), so the checks
+        // cost no gas on-chain while still guarding every test and debug run.
+        debug_assert!(
+            claimable_paid + refund == total_remaining,
+            "SEC-33: cancellation must settle the full remaining balance: paid ({}) + refund ({}) != remaining ({})",
+            claimable_paid,
+            refund,
+            total_remaining
+        );
+        debug_assert!(
+            stream.withdrawn <= stream.deposit,
+            "SEC-33: withdrawn ({}) must not exceed deposit ({})",
+            stream.withdrawn,
+            stream.deposit
+        );
+
         events::stream_cancelled(
             &env,
             stream_id,
-            claimable,
+            claimable_paid,
             refund,
         );
     }
@@ -1515,13 +1613,12 @@ impl StreamContract {
                 &receipt_owner(&env, &stream),
                 &amount,
             );
-            events::withdrawn(&env, stream_id, &receipt_owner(&env, &stream), amount);
         }
 
-        stream.withdrawn = stream
-            .withdrawn
-            .checked_add(amount)
-            .expect(ERR_OVERFLOW);
+        // SEC-33: the accrued amount has already been added to `withdrawn`
+        // above — it must not be counted a second time here, otherwise
+        // `withdrawn` would exceed `deposit` and break the settlement
+        // invariant that `withdraw` and `cancel_stream` assert.
         stream.last_withdraw_time = now;
         stream.pending_accrual = 0;
         set_stream_ended_at(&env, stream_id, now);
@@ -1648,6 +1745,60 @@ impl StreamContract {
             streams.push_back(load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND));
         }
         streams
+    }
+
+    /// Return the IDs of an employer's streams that currently have a given status.
+    ///
+    /// Dashboards use this to show, for example, only the Active streams of an
+    /// employer without having to call [`get_streams_batch`] and filter the
+    /// result client-side. No authorization is required — the call is
+    /// read-only.
+    ///
+    /// The result is capped at 50 entries. Use `offset` to page through larger
+    /// portfolios: `offset` counts matching streams that are skipped before
+    /// the returned page starts.
+    ///
+    /// Archived streams (moved to temporary storage by [`archive_stream`]) are
+    /// still reported, so a `Cancelled` or `Exhausted` query keeps working
+    /// after archiving.
+    ///
+    /// # Parameters
+    /// - `employer` — employer address to query
+    /// - `status` — status the streams must currently have
+    /// - `offset` — number of matching streams to skip before the page starts
+    ///
+    /// # Returns
+    /// `Vec<u64>` of stream IDs in creation order; empty when the employer has
+    /// no stream with that status.
+    pub fn get_streams_by_status(
+        env: Env,
+        employer: Address,
+        status: StreamStatus,
+        offset: u32,
+    ) -> Vec<u64> {
+        let stream_ids = stream_ids_by_employer(&env, &employer);
+        let mut matches: Vec<u64> = Vec::new(&env);
+        let mut skipped: u32 = 0;
+
+        for stream_id in stream_ids.iter() {
+            let stream = match load_stream_any(&env, stream_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if stream.status != status {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            matches.push_back(stream_id);
+            if matches.len() >= MAX_QUERY_RESULTS {
+                break;
+            }
+        }
+
+        matches
     }
 
     /// Query only the status of a stream by ID.

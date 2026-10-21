@@ -35,6 +35,11 @@ Example: the key for stream `7` is `Vec[ Symbol("Stream"), U64(7) ]`.
 | `Paused` | `Vec[Symbol("Paused")]` | `bool` | Instance | Global circuit breaker (absent = `false`) |
 | `Version` | `Vec[Symbol("Version")]` | `u32` | Instance | Written by `migrate` |
 | `PendingDrain` | `Vec[Symbol("PendingDrain")]` | — | Instance | Reserved for the emergency-drain proposal flow |
+| `StreamType(u64)` | `Vec[Symbol("StreamType"), U64(id)]` | `StreamType` | Persistent | Absent = `Payroll`; `LinearVest` for vesting streams |
+| `LinearVestSchedule(u64)` | `Vec[Symbol("LinearVestSchedule"), U64(id)]` | `LinearVestSchedule` | Persistent | Vesting terms of a linear-vest stream |
+| `StreamEndedAt(u64)` | `Vec[Symbol("StreamEndedAt"), U64(id)]` | `u64` | Persistent | Timestamp at which the stream became Cancelled/Exhausted (used by `archive_stream`) |
+| `MaxCreatesPerLedger` | `Vec[Symbol("MaxCreatesPerLedger")]` | `u32` | Instance | Per-employer, per-ledger creation cap (absent = `50`) |
+| `CreateCount(Address, u64)` | `Vec[Symbol("CreateCount"), Address, U64(ledger)]` | `u32` | Persistent | Streams created by the employer in that ledger |
 
 The upgrade timelock (`propose_upgrade` / `execute_upgrade`) additionally stores a
 `PendingUpgrade` value in instance storage under `DataKey::PendingUpgrade`.

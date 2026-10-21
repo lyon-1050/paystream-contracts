@@ -6,7 +6,7 @@ use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{Address, Env};
 
 use crate::storage;
-use crate::types::{StreamParams, StreamStatus};
+use crate::types::{AutoTopupConfig, StreamParams, StreamStatus};
 use crate::{StreamContract, StreamContractClient};
 
 fn setup() -> (Env, StreamContractClient<'static>) {
@@ -1535,6 +1535,9 @@ fn test_stream_ids_by_employer_load_100() {
     // Total tokens needed: STREAM_COUNT * deposit_per_stream.
     // setup_token mints 1_000_000_000 so we have plenty of headroom.
     client.set_min_deposit(&admin, &0, &100);
+    // Raise the per-ledger creation rate limit (SEC-24) so this load test can
+    // create 100 streams for the same employer.
+    client.set_max_creates_per_ledger(&admin, &1, &200);
 
     let mut expected_ids: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
 
@@ -1774,9 +1777,10 @@ fn test_withdraw_all_three_streams() {
     // All three streams yielded tokens
     assert_eq!(results.len(), 3);
 
-    assert_eq!(results.get(0).unwrap(), 1000); // 100s * 10/s
-    assert_eq!(results.get(1).unwrap(), 500); // 100s * 5/s
-    assert_eq!(results.get(2).unwrap(), 100); // 100s * 1/s
+    // Each entry is a (stream_id, amount_transferred) pair
+    assert_eq!(results.get(0).unwrap(), (id1, 1000)); // 100s * 10/s
+    assert_eq!(results.get(1).unwrap(), (id2, 500)); // 100s * 5/s
+    assert_eq!(results.get(2).unwrap(), (id3, 100)); // 100s * 1/s
 }
 
 /// Streams where claimable == 0 are silently skipped (no revert).
@@ -1822,7 +1826,7 @@ fn test_withdraw_all_skips_cancelled_and_paused() {
 
     // Only stream 3 is Active with claimable tokens
     assert_eq!(results.len(), 1);
-    assert_eq!(results.get(0).unwrap(), 100);
+    assert_eq!(results.get(0).unwrap(), (id3, 100));
     // 100 seconds total active for stream 3 (pause on id2 doesn't affect id3)
 }
 
@@ -1860,7 +1864,7 @@ fn test_withdraw_all_partial_claimable() {
 
     // Only id1 has claimable tokens
     assert_eq!(results.len(), 1);
-    assert_eq!(results.get(0).unwrap(), 1000); // 100s * 10/s
+    assert_eq!(results.get(0).unwrap(), (id1, 1000)); // 100s * 10/s
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,6 +2008,9 @@ fn test_streams_by_employee_paginated_caps_limit_at_50() {
     let token_id = setup_token(&env, &employer);
 
     client.initialize(&admin);
+    // The per-ledger creation rate limit (SEC-24) defaults to 50 streams per
+    // employer; raise it so this test can create 51 of them.
+    client.set_max_creates_per_ledger(&admin, &0, &100);
     for _ in 0..51 {
         client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
     }
@@ -2118,6 +2125,9 @@ fn test_stream_ids_by_token_caps_limit_at_50() {
     let token = setup_token(&env, &employer);
 
     client.initialize(&admin);
+    // The per-ledger creation rate limit (SEC-24) defaults to 50 streams per
+    // employer; raise it so this test can create 51 of them.
+    client.set_max_creates_per_ledger(&admin, &0, &100);
     for _ in 0..51 {
         client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None);
     }
@@ -2266,6 +2276,9 @@ fn test_cancel_streams_batch_over_max_panics() {
     let params = make_stream_params(&env, &token_id, 50);
     let mut ids = client.create_streams_batch(&employer, &params);
     let employee = Address::generate(&env);
+    // Move to the next ledger so the per-ledger creation rate limit does not
+    // mask the batch-size assertion below.
+    env.ledger().with_mut(|l| l.sequence_number += 1);
     ids.push_back(client.create_stream(&employer, &employee, &token_id, &100, &1, &0, &None));
 
     client.cancel_streams_batch(&employer, &ids);
@@ -3017,7 +3030,7 @@ fn test_expire_streams_eligible_stream_exhausted() {
     // stop_time = now + 100; rate=1/s so all 100 tokens stream by stop_time
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let stop_time: u64 = 1_000_100;
-    let id = client.create_stream(&employer, &employee, &token_id, &100, &1, &stop_time);
+    let id = client.create_stream(&employer, &employee, &token_id, &100, &1, &stop_time, &None);
 
     // Advance past stop_time + GRACE_PERIOD (7 days = 604_800 s)
     // Employee withdraws first to clear claimable (so claimable == 0)
@@ -3131,7 +3144,7 @@ fn test_expire_streams_still_claimable_skipped() {
 
     // Deposit more than rate * (stop - start) so tokens remain after stop_time
     let stop_time: u64 = 1_000_100;
-    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &1, &stop_time);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &1, &stop_time, &None);
 
     // Advance past grace period WITHOUT withdrawing — claimable > 0
     env.ledger().with_mut(|l| l.timestamp = stop_time + 604_801);
@@ -4598,4 +4611,323 @@ fn test_transfer_stream_new_employer_can_manage() {
 
     client.cancel_stream(&new_employer, &id);
     assert_eq!(client.get_stream(&id).status, StreamStatus::Cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// SC-46 (#329) — get_streams_by_status batch query
+// ---------------------------------------------------------------------------
+
+/// `get_streams_by_status` returns only the employer's streams that currently
+/// have the requested status.
+#[test]
+fn test_get_streams_by_status_filters_by_status() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let active_employee = Address::generate(&env);
+    let paused_employee = Address::generate(&env);
+    let cancelled_employee = Address::generate(&env);
+    let exhausted_employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    let active_id = client.create_stream(
+        &employer,
+        &active_employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+    );
+    let paused_id = client.create_stream(
+        &employer,
+        &paused_employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+    );
+    let cancelled_id = client.create_stream(
+        &employer,
+        &cancelled_employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+    );
+    let exhausted_id = client.create_stream(
+        &employer,
+        &exhausted_employee,
+        &token_id,
+        &500,
+        &10,
+        &0,
+        &None,
+    );
+
+    client.pause_stream(&employer, &paused_id);
+    client.cancel_stream(&employer, &cancelled_id);
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    // Withdraws the whole 500 deposit -> the stream becomes Exhausted.
+    client.withdraw(&exhausted_employee, &exhausted_id);
+
+    let active = client.get_streams_by_status(&employer, &StreamStatus::Active, &0);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get(0).unwrap(), active_id);
+
+    let paused = client.get_streams_by_status(&employer, &StreamStatus::Paused, &0);
+    assert_eq!(paused.len(), 1);
+    assert_eq!(paused.get(0).unwrap(), paused_id);
+
+    let cancelled = client.get_streams_by_status(&employer, &StreamStatus::Cancelled, &0);
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled.get(0).unwrap(), cancelled_id);
+
+    let exhausted = client.get_streams_by_status(&employer, &StreamStatus::Exhausted, &0);
+    assert_eq!(exhausted.len(), 1);
+    assert_eq!(exhausted.get(0).unwrap(), exhausted_id);
+}
+
+/// `get_streams_by_status` never returns streams belonging to another employer.
+#[test]
+fn test_get_streams_by_status_is_scoped_to_the_employer() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let other_employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    let own_id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+    let other_id = client.create_stream(
+        &other_employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+    );
+
+    let own = client.get_streams_by_status(&employer, &StreamStatus::Active, &0);
+    assert_eq!(own.len(), 1);
+    assert_eq!(own.get(0).unwrap(), own_id);
+
+    let other = client.get_streams_by_status(&other_employer, &StreamStatus::Active, &0);
+    assert_eq!(other.len(), 1);
+    assert_eq!(other.get(0).unwrap(), other_id);
+}
+
+/// An employer without any stream with the requested status gets an empty
+/// vector instead of a panic.
+#[test]
+fn test_get_streams_by_status_returns_empty_for_no_match() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    // Employer without any stream at all.
+    let empty = client.get_streams_by_status(&employer, &StreamStatus::Active, &0);
+    assert!(empty.is_empty());
+
+    // Employer with an Active stream, but no Cancelled one.
+    client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+    let no_match = client.get_streams_by_status(&employer, &StreamStatus::Cancelled, &0);
+    assert!(no_match.is_empty());
+}
+
+/// `offset` pages through the matching streams.
+#[test]
+fn test_get_streams_by_status_offset_paginates() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    let first = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+    let second = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+    let third = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    let page_one = client.get_streams_by_status(&employer, &StreamStatus::Active, &0);
+    assert_eq!(page_one.len(), 3);
+    assert_eq!(page_one.get(0).unwrap(), first);
+    assert_eq!(page_one.get(1).unwrap(), second);
+    assert_eq!(page_one.get(2).unwrap(), third);
+
+    let page_two = client.get_streams_by_status(&employer, &StreamStatus::Active, &1);
+    assert_eq!(page_two.len(), 2);
+    assert_eq!(page_two.get(0).unwrap(), second);
+    assert_eq!(page_two.get(1).unwrap(), third);
+
+    let page_three = client.get_streams_by_status(&employer, &StreamStatus::Active, &2);
+    assert_eq!(page_three.len(), 1);
+    assert_eq!(page_three.get(0).unwrap(), third);
+
+    // Offset beyond the last match returns an empty page.
+    let page_four = client.get_streams_by_status(&employer, &StreamStatus::Active, &3);
+    assert!(page_four.is_empty());
+}
+
+/// The result is capped at 50 entries; larger portfolios are paged with
+/// `offset`.
+#[test]
+fn test_get_streams_by_status_caps_results_at_50() {
+    const STREAM_COUNT: u32 = 55;
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    // Raise the per-ledger creation cap so the whole portfolio fits in one
+    // ledger (nonce 1 — `set_min_deposit` above consumed nonce 0).
+    client.set_max_creates_per_ledger(&admin, &1, &100);
+
+    for _ in 0..STREAM_COUNT {
+        client.create_stream(&employer, &employee, &token_id, &100, &1, &0, &None);
+    }
+
+    let first_page = client.get_streams_by_status(&employer, &StreamStatus::Active, &0);
+    assert_eq!(first_page.len(), 50);
+
+    let second_page = client.get_streams_by_status(&employer, &StreamStatus::Active, &50);
+    assert_eq!(second_page.len(), 5);
+    assert_eq!(second_page.get(0).unwrap(), 51);
+    assert_eq!(second_page.get(4).unwrap(), 55);
+}
+
+// ---------------------------------------------------------------------------
+// SEC-33 (#330) — invariant assertions in withdraw and cancel_stream
+// ---------------------------------------------------------------------------
+
+/// The post-conditions asserted at the end of `withdraw`
+/// (`withdrawn <= deposit` and `!locked`) hold for a normal withdrawal.
+/// The assertions are `debug_assert!`s, so a violation would abort the test.
+#[test]
+fn test_withdraw_invariants_hold_after_withdraw() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    let withdrawn = client.withdraw(&employee, &id);
+    assert_eq!(withdrawn, 1_000);
+
+    let stream = client.get_stream(&id);
+    assert!(
+        stream.withdrawn <= stream.deposit,
+        "withdrawn ({}) must not exceed deposit ({})",
+        stream.withdrawn,
+        stream.deposit
+    );
+    assert!(!stream.locked, "the re-entrancy lock must be released");
+    assert_eq!(stream.withdrawn, 1_000);
+    assert_eq!(stream.deposit, 10_000);
+}
+
+/// The same post-conditions hold after a withdrawal that exhausts the stream.
+#[test]
+fn test_withdraw_invariants_hold_after_exhausting_withdraw() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    let id = client.create_stream(&employer, &employee, &token_id, &500, &10, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.withdraw(&employee, &id);
+
+    let stream = client.get_stream(&id);
+    assert_eq!(stream.status, StreamStatus::Exhausted);
+    assert_eq!(stream.withdrawn, 500);
+    assert!(stream.withdrawn <= stream.deposit);
+    assert!(!stream.locked);
+}
+
+/// The post-conditions asserted at the end of `cancel_stream` hold: the
+/// cancellation settles the full remaining balance, i.e. the amount paid to
+/// the employee plus the refund to the employer equals the amount that was
+/// still owed when the stream was cancelled.
+#[test]
+fn test_cancel_stream_settles_the_full_remaining_balance() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    let employer_balance_before = token.balance(&employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.cancel_stream(&employer, &id);
+
+    // 100 s * 10 tokens/s = 1_000 tokens paid to the employee, 9_000 refunded.
+    assert_eq!(token.balance(&employee), 1_000);
+    assert_eq!(token.balance(&employer), employer_balance_before - 1_000);
+
+    let stream = client.get_stream(&id);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+    assert_eq!(stream.withdrawn, 1_000);
+    assert!(stream.withdrawn <= stream.deposit);
+}
+
+/// Cancelling a stream that has not accrued anything refunds the full
+/// deposit — the settlement assertion must hold for that case as well.
+#[test]
+fn test_cancel_stream_without_accrual_refunds_the_full_deposit() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    let employer_balance_before = token.balance(&employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    client.cancel_stream(&employer, &id);
+
+    assert_eq!(token.balance(&employee), 0);
+    assert_eq!(token.balance(&employer), employer_balance_before);
+
+    let stream = client.get_stream(&id);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+    assert_eq!(stream.withdrawn, 0);
+    assert!(stream.withdrawn <= stream.deposit);
 }
