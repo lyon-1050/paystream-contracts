@@ -70,9 +70,7 @@ impl Rng {
     /// Create a generator for `seed`. Zero is remapped to a non-zero state
     /// because xorshift cannot escape the zero state.
     fn new(seed: u64) -> Self {
-        Self {
-            state: seed | 1,
-        }
+        Self { state: seed | 1 }
     }
 
     /// Return the next pseudo random 64-bit value.
@@ -123,6 +121,10 @@ enum Op {
 }
 
 /// The invariant that a generated sequence violated.
+///
+/// The payload is only read through its `Debug` rendering in the failure
+/// message, which the dead-code lint does not count as a read.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum ViolationKind {
     /// `withdrawn` exceeded `deposit`.
@@ -170,7 +172,13 @@ fn generate_sequence(rng: &mut Rng) -> [Op; MAX_OPS] {
 }
 
 /// Set up a contract instance with a funded employer, an employee and a token.
-fn setup() -> (Env, StreamContractClient<'static>, Address, Address, Address) {
+fn setup() -> (
+    Env,
+    StreamContractClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(StreamContract, ());
@@ -236,15 +244,8 @@ fn run_sequence(ops: &[Op]) -> Result<(), Violation> {
                 // Give the employer a fresh per-ledger creation budget so the
                 // sequence is never rejected by the creation rate limit.
                 env.ledger().with_mut(|l| l.sequence_number += 1);
-                let id = client.create_stream(
-                    &employer,
-                    &employee,
-                    &token_id,
-                    &deposit,
-                    &rate,
-                    &0,
-                    &None,
-                );
+                let id = client
+                    .create_stream(&employer, &employee, &token_id, &deposit, &rate, &0, &None);
                 stream_id = Some(id);
             }
             Op::TopUp { amount } => {
@@ -296,7 +297,10 @@ fn run_sequence(ops: &[Op]) -> Result<(), Violation> {
 
         if let Some(id) = stream_id {
             if let Err(kind) = check_invariants(&client, id) {
-                return Err(Violation { op_index: index, kind });
+                return Err(Violation {
+                    op_index: index,
+                    kind,
+                });
             }
         }
     }
@@ -428,7 +432,10 @@ fn chaos_generator_covers_every_operation() {
 
     assert!(seen_create, "generator never produced a create operation");
     assert!(seen_top_up, "generator never produced a top-up operation");
-    assert!(seen_withdraw, "generator never produced a withdraw operation");
+    assert!(
+        seen_withdraw,
+        "generator never produced a withdraw operation"
+    );
     assert!(seen_pause, "generator never produced a pause operation");
     assert!(seen_resume, "generator never produced a resume operation");
     assert!(

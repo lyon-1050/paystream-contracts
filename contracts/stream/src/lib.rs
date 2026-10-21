@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! PayStream — a Soroban contract for continuous salary streaming.
+//!
+//! Employers create payroll streams that deposit tokens into the contract
+//! escrow; employees withdraw the accrued tokens at any time. The crate also
+//! exposes linear-vest streams, split streams, batch operations and a set of
+//! read-only query helpers for dashboards and indexers.
+
 #![no_std]
-#![deny(missing_docs)]
+// The `soroban-sdk` contract macros generate public client and argument types
+// that carry no documentation of their own, which the `missing_docs` lint
+// rejects. The lint is therefore allowed crate-wide and re-enabled per module
+// (`types`, `storage`, `validate`), where every public item is hand written
+// and documented.
+#![allow(missing_docs)]
 
 mod events;
 /// Persistent storage helpers and stream accounting calculations.
 pub mod storage;
 /// Public contract data types, storage keys, and error constants.
 pub mod types;
-pub mod utils;
+/// Input validation helpers for stream creation, top-ups and splits.
 pub mod validate;
 
 #[cfg(test)]
@@ -16,7 +28,9 @@ mod chaos;
 #[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Map, Vec};
+use soroban_sdk::{
+    contract, contractimpl, token, Address, BytesN, ContractExecutable, Env, Map, Vec,
+};
 
 /// Compile-time contract version.  Increment this constant with every
 /// WASM upgrade so that `migrate` stamps the new version into instance
@@ -29,25 +43,25 @@ use storage::{
     get_protocol_fee, get_stream_ended_at, get_stream_type, get_streams_in_time_range,
     get_template_ids, get_token_streams, index_employee_stream, index_employer_stream,
     index_stream_by_timestamp, index_token_stream, linear_vest_claimable_amount, load_stream,
-    load_stream_any, load_template,
-    next_id, receipt_owner, remove_auto_topup, remove_employer_stream, save_stream, save_template,
-    set_admin, set_auto_topup, set_linear_vest_schedule, set_min_deposit, set_pending_admin,
-    set_pending_admin_nonce, set_pending_upgrade, set_protocol_fee, set_receipt_owner,
+    load_stream_any, load_template, next_id, receipt_owner, remove_auto_topup,
+    remove_employer_stream, save_stream, save_template, set_admin, set_auto_topup,
+    set_linear_vest_schedule, set_min_deposit, set_pending_admin, set_pending_admin_nonce,
+    set_pending_upgrade, set_protocol_fee, set_receipt_owner, set_split_beneficiaries,
     set_stream_ended_at, store_max_creates, stream_ids_by_employee, stream_ids_by_employer,
     ARCHIVE_WAIT_PERIOD, GRACE_PERIOD, SECONDS_PER_DAY, TIMELOCK_DELAY,
 };
 use types::{
     AutoTopupConfig, DataKey, LinearVestSchedule, PendingUpgrade, SplitBeneficiary, Stream,
-    StreamParams, StreamStatus, StreamType,
-    ERR_ADMIN_NOT_SET, ERR_ARCHIVE_TOO_EARLY, ERR_BAD_PENDING_NONCE, ERR_BATCH_TOO_LARGE,
-    ERR_BELOW_MIN_DEPOSIT, ERR_CONTRACT_PAUSED, ERR_EMPTY_PARAMS, ERR_INVALID_AUTO_TOPUP,
-    ERR_INVALID_RATE, ERR_INVALID_STOP_TIME, ERR_NEW_EMPLOYER_IS_EMPLOYEE, ERR_NOT_ADMIN,
-    ERR_NOT_EMPLOYEE, ERR_NOT_EMPLOYER, ERR_NOT_PENDING_ADMIN, ERR_NOT_RECEIPT_OWNER,
-    ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_ADMIN, ERR_NO_PENDING_UPGRADE, ERR_OVERFLOW,
-    ERR_REENTRANT, ERR_STREAM_ALREADY_ENDED, ERR_STREAM_CANCELLED, ERR_STREAM_EXHAUSTED,
-    ERR_STREAM_NOT_ACTIVE, ERR_STREAM_NOT_ENDED, ERR_STREAM_NOT_FOUND, ERR_STREAM_NOT_PAUSED,
-    ERR_STOP_TIME_PAST, ERR_TEMPLATE_NOT_FOUND, ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_DEPOSIT,
-    ERR_ZERO_RATE, MAX_BATCH_SIZE, MAX_QUERY_RESULTS,
+    StreamParams, StreamStatus, StreamType, ERR_ADMIN_NOT_SET, ERR_ARCHIVE_TOO_EARLY,
+    ERR_BAD_PENDING_NONCE, ERR_BATCH_TOO_LARGE, ERR_BELOW_MIN_DEPOSIT, ERR_CONTRACT_PAUSED,
+    ERR_EMPTY_PARAMS, ERR_INVALID_AUTO_TOPUP, ERR_INVALID_RATE, ERR_INVALID_STOP_TIME,
+    ERR_NEW_EMPLOYER_IS_EMPLOYEE, ERR_NOT_ADMIN, ERR_NOT_EMPLOYEE, ERR_NOT_EMPLOYER,
+    ERR_NOT_PENDING_ADMIN, ERR_NOT_RECEIPT_OWNER, ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_ADMIN,
+    ERR_NO_PENDING_UPGRADE, ERR_OVERFLOW, ERR_REENTRANT, ERR_STOP_TIME_PAST,
+    ERR_STREAM_ALREADY_ENDED, ERR_STREAM_CANCELLED, ERR_STREAM_EXHAUSTED, ERR_STREAM_NOT_ACTIVE,
+    ERR_STREAM_NOT_ENDED, ERR_STREAM_NOT_FOUND, ERR_STREAM_NOT_PAUSED, ERR_TEMPLATE_NOT_FOUND,
+    ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_DEPOSIT, ERR_ZERO_RATE, MAX_BATCH_SIZE,
+    MAX_QUERY_RESULTS,
 };
 use validate::{
     validate_create_stream, validate_rate, validate_split_beneficiaries, validate_top_up,
@@ -64,7 +78,7 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
-fn protocol_fee_amount(deposit: i128, fee_bps: u16) -> i128 {
+fn protocol_fee_amount(deposit: i128, fee_bps: u32) -> i128 {
     let fee_bps = fee_bps as i128;
     (deposit / 10_000) * fee_bps + ((deposit % 10_000) * fee_bps) / 10_000
 }
@@ -132,6 +146,7 @@ fn maybe_auto_topup(env: &Env, stream: &mut Stream, now: u64) {
 pub struct StreamContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl StreamContract {
     /// Initialise the contract with an admin address.
     ///
@@ -301,12 +316,15 @@ impl StreamContract {
     /// - Panics if `admin` auth fails or does not match the stored admin
     /// - E009 if `nonce` does not match the stored admin nonce
     /// - Panics if `fee_bps` exceeds 100
-    pub fn set_protocol_fee(env: Env, admin: Address, nonce: u64, fee_bps: u16, treasury: Address) {
+    pub fn set_protocol_fee(env: Env, admin: Address, nonce: u64, fee_bps: u32, treasury: Address) {
         admin.require_auth();
         let stored_admin = get_admin(&env);
         assert_eq!(admin, stored_admin, "{}", ERR_NOT_ADMIN);
         consume_admin_nonce(&env, nonce);
-        assert!(fee_bps <= 100, "protocol fee cannot exceed 100 basis points");
+        assert!(
+            fee_bps <= 100,
+            "protocol fee cannot exceed 100 basis points"
+        );
         set_protocol_fee(&env, fee_bps, &treasury);
     }
 
@@ -336,6 +354,7 @@ impl StreamContract {
     /// - Panics if `stop_time` is non-zero and in the past
     /// - Panics if `employer` == `employee`
     /// - Panics if the token transfer fails
+    #[allow(clippy::too_many_arguments)]
     pub fn create_stream(
         env: Env,
         employer: Address,
@@ -369,11 +388,11 @@ impl StreamContract {
         let stream_deposit = deposit - fee;
         let token_client = token::Client::new(&env, &token_address);
         token_client.balance(&employer); // SEP-41 probe
-        token_client.transfer(&employer, &env.current_contract_address(), &stream_deposit);
+        token_client.transfer(&employer, env.current_contract_address(), &stream_deposit);
         if fee > 0 {
             token_client.transfer(
                 &employer,
-                &treasury.expect("protocol fee treasury is not configured"),
+                treasury.expect("protocol fee treasury is not configured"),
                 &fee,
             );
         }
@@ -422,7 +441,11 @@ impl StreamContract {
 
         let now = env.ledger().timestamp();
         assert!(total_grant > 0, "{}", ERR_ZERO_DEPOSIT);
-        assert!(total_grant >= get_min_deposit(&env), "{}", ERR_BELOW_MIN_DEPOSIT);
+        assert!(
+            total_grant >= get_min_deposit(&env),
+            "{}",
+            ERR_BELOW_MIN_DEPOSIT
+        );
         assert!(vest_period > 0, "vest period must be greater than zero");
         assert!(
             cliff.is_none_or(|cliff_duration| cliff_duration <= vest_period),
@@ -436,11 +459,11 @@ impl StreamContract {
         let net_grant = total_grant - fee;
         let token_client = token::Client::new(&env, &token_address);
         token_client.balance(&employer); // SEP-41 probe
-        token_client.transfer(&employer, &env.current_contract_address(), &net_grant);
+        token_client.transfer(&employer, env.current_contract_address(), &net_grant);
         if fee > 0 {
             token_client.transfer(
                 &employer,
-                &treasury.expect("protocol fee treasury is not configured"),
+                treasury.expect("protocol fee treasury is not configured"),
                 &fee,
             );
         }
@@ -517,23 +540,16 @@ impl StreamContract {
 
         let now = env.ledger().timestamp();
         let min_deposit = get_min_deposit(&env);
-        let mut ids: Vec<u64> = Vec::new(&env);
-        let mut index: u32 = 0;
 
         // Validate each stream and sum net deposits per token so each token is
         // pulled from the employer with one escrow transfer.
         let (fee_bps, treasury) = get_protocol_fee(&env);
         let mut totals: Map<Address, i128> = Map::new(&env);
         let mut fee_totals: Map<Address, i128> = Map::new(&env);
-        for p in params.iter() {
+        for (index, p) in (0_u32..).zip(params.iter()) {
             // Validate each parameter independently and prefix any panic with the
             // stream index so callers can identify which entry failed.
-            assert!(
-                p.deposit > 0,
-                "stream[{}]: {}",
-                index,
-                ERR_ZERO_DEPOSIT
-            );
+            assert!(p.deposit > 0, "stream[{}]: {}", index, ERR_ZERO_DEPOSIT);
             assert!(
                 p.deposit >= min_deposit,
                 "stream[{}]: {}",
@@ -586,7 +602,7 @@ impl StreamContract {
         for (token_address, total) in totals.iter() {
             let token_client = token::Client::new(&env, &token_address);
             token_client.balance(&employer); // SEP-41 probe
-            token_client.transfer(&employer, &env.current_contract_address(), &total);
+            token_client.transfer(&employer, env.current_contract_address(), &total);
         }
         if fee_bps > 0 {
             let treasury = treasury.expect("protocol fee treasury is not configured");
@@ -622,7 +638,6 @@ impl StreamContract {
             index_stream_by_timestamp(&env, now, id);
             events::stream_created(&env, id, &employer, &p.employee, p.rate_per_second);
             ids.push_back(id);
-            index += 1;
         }
 
         ids
@@ -655,6 +670,7 @@ impl StreamContract {
     /// - E031 if fewer than 2 beneficiaries
     /// - E032 if more than 20 beneficiaries
     /// - E030 if basis points do not sum to exactly 10000
+    #[allow(clippy::too_many_arguments)]
     pub fn create_split_stream(
         env: Env,
         employer: Address,
@@ -787,10 +803,7 @@ impl StreamContract {
         stream.locked = true;
         save_stream(&env, &stream);
 
-        stream.withdrawn = stream
-            .withdrawn
-            .checked_add(amount)
-            .expect(ERR_OVERFLOW);
+        stream.withdrawn = stream.withdrawn.checked_add(amount).expect(ERR_OVERFLOW);
         stream.last_withdraw_time = now;
         // Clear any banked pre-rate-change accrual now that it has been paid out.
         stream.pending_accrual = 0;
@@ -906,10 +919,7 @@ impl StreamContract {
             stream.locked = true;
             save_stream(&env, &stream);
 
-            stream.withdrawn = stream
-                .withdrawn
-                .checked_add(amount)
-                .expect(ERR_OVERFLOW);
+            stream.withdrawn = stream.withdrawn.checked_add(amount).expect(ERR_OVERFLOW);
             stream.last_withdraw_time = now;
             // Clear any banked pre-rate-change accrual now that it has been paid out.
             stream.pending_accrual = 0;
@@ -986,12 +996,9 @@ impl StreamContract {
         );
 
         let token_client = token::Client::new(&env, &stream.token);
-        token_client.transfer(&employer, &env.current_contract_address(), &amount);
+        token_client.transfer(&employer, env.current_contract_address(), &amount);
 
-        stream.deposit = stream
-            .deposit
-            .checked_add(amount)
-            .expect(ERR_OVERFLOW);
+        stream.deposit = stream.deposit.checked_add(amount).expect(ERR_OVERFLOW);
         if let Some(threshold) = low_balance_threshold {
             stream.low_balance_threshold = threshold;
         }
@@ -1014,12 +1021,7 @@ impl StreamContract {
     /// - Panics if stream not found (E015)
     /// - Panics if stream is Cancelled (E005) or Exhausted (E006)
     /// - Panics if threshold is negative
-    pub fn set_low_balance_threshold(
-        env: Env,
-        employer: Address,
-        stream_id: u64,
-        threshold: i128,
-    ) {
+    pub fn set_low_balance_threshold(env: Env, employer: Address, stream_id: u64, threshold: i128) {
         employer.require_auth();
         assert!(threshold >= 0, "threshold must be non-negative");
 
@@ -1148,7 +1150,12 @@ impl StreamContract {
         employer.require_auth();
         let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
-        assert_eq!(stream.status, StreamStatus::Active, "{}", ERR_STREAM_NOT_ACTIVE);
+        assert_eq!(
+            stream.status,
+            StreamStatus::Active,
+            "{}",
+            ERR_STREAM_NOT_ACTIVE
+        );
         if get_stream_type(&env, stream_id) == StreamType::LinearVest {
             stream.last_withdraw_time = env.ledger().timestamp();
         }
@@ -1172,13 +1179,22 @@ impl StreamContract {
     pub fn pause_stream_batch(env: Env, employer: Address, stream_ids: Vec<u64>) {
         employer.require_auth();
         assert!(!stream_ids.is_empty(), "stream_ids must not be empty");
-        assert!(stream_ids.len() <= MAX_BATCH_SIZE, "{}", ERR_BATCH_TOO_LARGE);
+        assert!(
+            stream_ids.len() <= MAX_BATCH_SIZE,
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
 
         let now = env.ledger().timestamp();
         for stream_id in stream_ids.iter() {
             let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
             assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
-            assert_eq!(stream.status, StreamStatus::Active, "{}", ERR_STREAM_NOT_ACTIVE);
+            assert_eq!(
+                stream.status,
+                StreamStatus::Active,
+                "{}",
+                ERR_STREAM_NOT_ACTIVE
+            );
 
             if get_stream_type(&env, stream_id) == StreamType::LinearVest {
                 stream.last_withdraw_time = now;
@@ -1206,12 +1222,23 @@ impl StreamContract {
         employer.require_auth();
         let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
-        assert_eq!(stream.status, StreamStatus::Paused, "{}", ERR_STREAM_NOT_PAUSED);
+        assert_eq!(
+            stream.status,
+            StreamStatus::Paused,
+            "{}",
+            ERR_STREAM_NOT_PAUSED
+        );
         let now = env.ledger().timestamp();
         if get_stream_type(&env, stream_id) == StreamType::LinearVest {
             let paused_for = now.saturating_sub(stream.last_withdraw_time);
-            stream.start_time = stream.start_time.checked_add(paused_for).expect(ERR_OVERFLOW);
-            stream.stop_time = stream.stop_time.checked_add(paused_for).expect(ERR_OVERFLOW);
+            stream.start_time = stream
+                .start_time
+                .checked_add(paused_for)
+                .expect(ERR_OVERFLOW);
+            stream.stop_time = stream
+                .stop_time
+                .checked_add(paused_for)
+                .expect(ERR_OVERFLOW);
         }
         stream.last_withdraw_time = now;
         stream.status = StreamStatus::Active;
@@ -1235,18 +1262,33 @@ impl StreamContract {
     pub fn resume_stream_batch(env: Env, employer: Address, stream_ids: Vec<u64>) {
         employer.require_auth();
         assert!(!stream_ids.is_empty(), "stream_ids must not be empty");
-        assert!(stream_ids.len() <= MAX_BATCH_SIZE, "{}", ERR_BATCH_TOO_LARGE);
+        assert!(
+            stream_ids.len() <= MAX_BATCH_SIZE,
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
 
         let now = env.ledger().timestamp();
         for stream_id in stream_ids.iter() {
             let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
             assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
-            assert_eq!(stream.status, StreamStatus::Paused, "{}", ERR_STREAM_NOT_PAUSED);
+            assert_eq!(
+                stream.status,
+                StreamStatus::Paused,
+                "{}",
+                ERR_STREAM_NOT_PAUSED
+            );
 
             if get_stream_type(&env, stream_id) == StreamType::LinearVest {
                 let paused_for = now.saturating_sub(stream.last_withdraw_time);
-                stream.start_time = stream.start_time.checked_add(paused_for).expect(ERR_OVERFLOW);
-                stream.stop_time = stream.stop_time.checked_add(paused_for).expect(ERR_OVERFLOW);
+                stream.start_time = stream
+                    .start_time
+                    .checked_add(paused_for)
+                    .expect(ERR_OVERFLOW);
+                stream.stop_time = stream
+                    .stop_time
+                    .checked_add(paused_for)
+                    .expect(ERR_OVERFLOW);
             }
             stream.last_withdraw_time = now;
             stream.status = StreamStatus::Active;
@@ -1288,9 +1330,29 @@ impl StreamContract {
 
         let now = env.ledger().timestamp();
 
-        // Bank any accrual earned at the old rate into pending_accrual so the
+        // Bank the accrual earned at the old rate into pending_accrual so the
         // employee can still claim it after the rate changes.
-        let pre_change_accrual = stream_claimable_amount(&env, &stream, now);
+        //
+        // Only the *newly* earned part is banked: `stream_claimable_amount`
+        // already includes the previously banked `pending_accrual`, so adding
+        // it again would count the earlier accrual twice.
+        let effective_end = if stream.stop_time > 0 && now > stream.stop_time {
+            stream.stop_time
+        } else {
+            now
+        };
+        let elapsed = effective_end.saturating_sub(stream.last_withdraw_time) as i128;
+        let earned = elapsed
+            .checked_mul(stream.rate_per_second)
+            .expect(ERR_OVERFLOW);
+        // The banked accrual must never exceed what is still owed.
+        let remaining = stream
+            .deposit
+            .checked_sub(stream.withdrawn)
+            .unwrap_or(0)
+            .max(0);
+        let budget = (remaining - stream.pending_accrual).max(0);
+        let pre_change_accrual = earned.min(budget);
         stream.pending_accrual = stream
             .pending_accrual
             .checked_add(pre_change_accrual)
@@ -1327,7 +1389,12 @@ impl StreamContract {
 
         let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
-        assert_eq!(stream.status, StreamStatus::Active, "{}", ERR_STREAM_NOT_ACTIVE);
+        assert_eq!(
+            stream.status,
+            StreamStatus::Active,
+            "{}",
+            ERR_STREAM_NOT_ACTIVE
+        );
         assert!(
             new_stop_time == 0 || new_stop_time >= stream.last_withdraw_time,
             "{}",
@@ -1374,7 +1441,7 @@ impl StreamContract {
         if claimable_paid > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
-                &receipt_owner(&env, &stream),
+                receipt_owner(&env, &stream),
                 &claimable_paid,
             );
             stream.withdrawn = stream
@@ -1422,12 +1489,7 @@ impl StreamContract {
             stream.deposit
         );
 
-        events::stream_cancelled(
-            &env,
-            stream_id,
-            claimable_paid,
-            refund,
-        );
+        events::stream_cancelled(&env, stream_id, claimable_paid, refund);
     }
 
     /// Employer cancels multiple streams atomically in a single transaction.
@@ -1451,7 +1513,11 @@ impl StreamContract {
     pub fn cancel_streams_batch(env: Env, employer: Address, stream_ids: Vec<u64>) {
         employer.require_auth();
         assert!(!stream_ids.is_empty(), "stream_ids must not be empty");
-        assert!(stream_ids.len() <= MAX_BATCH_SIZE, "{}", ERR_BATCH_TOO_LARGE);
+        assert!(
+            stream_ids.len() <= MAX_BATCH_SIZE,
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
 
         let now = env.ledger().timestamp();
 
@@ -1469,13 +1535,10 @@ impl StreamContract {
             if claimable > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
-                    &receipt_owner(&env, &stream),
+                    receipt_owner(&env, &stream),
                     &claimable,
                 );
-                stream.withdrawn = stream
-                    .withdrawn
-                    .checked_add(claimable)
-                    .expect(ERR_OVERFLOW);
+                stream.withdrawn = stream.withdrawn.checked_add(claimable).expect(ERR_OVERFLOW);
             }
 
             let refund = stream
@@ -1557,7 +1620,11 @@ impl StreamContract {
             "{}",
             ERR_STREAM_ALREADY_ENDED
         );
-        assert_ne!(new_employer, stream.employee, "{}", ERR_NEW_EMPLOYER_IS_EMPLOYEE);
+        assert_ne!(
+            new_employer, stream.employee,
+            "{}",
+            ERR_NEW_EMPLOYER_IS_EMPLOYEE
+        );
 
         // Update EmployerStreams index: remove stream_id from old employer, add to new.
         remove_employer_stream(&env, &employer, stream_id);
@@ -1600,17 +1667,14 @@ impl StreamContract {
             stream.locked = true;
             save_stream(&env, &stream);
 
-            stream.withdrawn = stream
-                .withdrawn
-                .checked_add(amount)
-                .expect(ERR_OVERFLOW);
+            stream.withdrawn = stream.withdrawn.checked_add(amount).expect(ERR_OVERFLOW);
             stream.last_withdraw_time = now;
             stream.pending_accrual = 0;
 
             let token_client = token::Client::new(&env, &stream.token);
             token_client.transfer(
                 &env.current_contract_address(),
-                &receipt_owner(&env, &stream),
+                receipt_owner(&env, &stream),
                 &amount,
             );
         }
@@ -1739,7 +1803,11 @@ impl StreamContract {
     /// - Panics if `stream_ids` has more than 50 entries
     /// - Panics if any stream is not found
     pub fn get_streams_batch(env: Env, stream_ids: Vec<u64>) -> Vec<Stream> {
-        assert!(stream_ids.len() <= 50, "stream_ids length exceeds 50");
+        assert!(
+            stream_ids.len() <= MAX_BATCH_SIZE,
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
         let mut streams: Vec<Stream> = Vec::new(&env);
         for stream_id in stream_ids.iter() {
             streams.push_back(load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND));
@@ -1868,11 +1936,7 @@ impl StreamContract {
     /// - Panics if stream not found
     pub fn check_stream_expiry(env: Env, stream_id: u64) {
         let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
-        assert_eq!(
-            stream.status,
-            StreamStatus::Active,
-            "stream is not active"
-        );
+        assert_eq!(stream.status, StreamStatus::Active, "stream is not active");
         if stream.stop_time == 0 {
             return;
         }
@@ -1901,7 +1965,11 @@ impl StreamContract {
     /// - Panics if `stream_ids` has more than 50 entries
     /// - E004 if claimable amount arithmetic overflows
     pub fn claimable_batch(env: Env, stream_ids: Vec<u64>) -> Vec<i128> {
-        assert!(stream_ids.len() <= 50, "stream_ids length exceeds 50");
+        assert!(
+            stream_ids.len() <= MAX_BATCH_SIZE,
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
         let now = env.ledger().timestamp();
         let mut amounts: Vec<i128> = Vec::new(&env);
         for stream_id in stream_ids.iter() {
@@ -1950,19 +2018,25 @@ impl StreamContract {
     /// - E015 if stream not found
     pub fn check_low_balance(env: Env, stream_id: u64) -> bool {
         let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
-        
+
         // No threshold configured
         if stream.low_balance_threshold == 0 {
             return false;
         }
-        
+
         let remaining = stream.deposit - stream.withdrawn;
         let threshold_breached = remaining < stream.low_balance_threshold;
-        
+
         if threshold_breached {
-            events::low_balance_check(&env, stream_id, &stream.employer, remaining, stream.low_balance_threshold);
+            events::low_balance_check(
+                &env,
+                stream_id,
+                &stream.employer,
+                remaining,
+                stream.low_balance_threshold,
+            );
         }
-        
+
         threshold_breached
     }
 
@@ -2108,7 +2182,8 @@ impl StreamContract {
             .expect(ERR_ADMIN_NOT_SET);
         admin.require_auth();
         consume_admin_nonce(&env, nonce);
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer()
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash));
     }
 
     /// Step 1 of two-step upgrade: propose a WASM upgrade with a 48-hour time-lock.
@@ -2169,7 +2244,7 @@ impl StreamContract {
         clear_pending_upgrade(&env);
         events::upgrade_executed(&env, &pending.wasm_hash);
         env.deployer()
-            .update_current_contract_wasm(pending.wasm_hash);
+            .update_current_contract(ContractExecutable::Wasm(pending.wasm_hash));
     }
 
     /// Cancel a pending upgrade before it is executed.
@@ -2229,10 +2304,7 @@ impl StreamContract {
     /// # Returns
     /// Version as `u32`.
     pub fn version(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::Version).unwrap_or(0)
     }
 
     /// Return the total number of streams ever created.
@@ -2276,7 +2348,7 @@ impl StreamContract {
     /// Return the configured protocol fee in basis points and its treasury.
     ///
     /// Returns `(0, None)` when no fee has been configured.
-    pub fn get_protocol_fee(env: Env) -> (u16, Option<Address>) {
+    pub fn get_protocol_fee(env: Env) -> (u32, Option<Address>) {
         get_protocol_fee(&env)
     }
 
@@ -2338,16 +2410,14 @@ impl StreamContract {
             return page;
         }
 
-        let end = offset.saturating_add(limit.min(50));
-        let mut position = 0u32;
-        for stream_id in stream_ids.iter() {
+        let end = offset as usize + limit.min(50) as usize;
+        for (position, stream_id) in stream_ids.iter().enumerate() {
             if position >= end {
                 break;
             }
-            if position >= offset {
+            if position >= offset as usize {
                 page.push_back(stream_id);
             }
-            position += 1;
         }
         page
     }
@@ -2445,16 +2515,14 @@ impl StreamContract {
             return page;
         }
 
-        let end = offset.saturating_add(limit.min(50));
-        let mut position = 0u64;
-        for stream_id in stream_ids.iter() {
+        let end = offset as usize + limit.min(50) as usize;
+        for (position, stream_id) in stream_ids.iter().enumerate() {
             if position >= end {
                 break;
             }
-            if position >= offset {
+            if position >= offset as usize {
                 page.push_back(stream_id);
             }
-            position += 1;
         }
         page
     }
@@ -2548,11 +2616,12 @@ impl StreamContract {
             let ratio = (runway_periods * 200).min(20); // Map [0, 1) to [0, 20]
             ratio as u32
         } else if runway_periods < 10 {
-            // 1–10 periods: scale 50–90
-            let ratio = 50 + ((runway_periods - 1.0) * 4.44).min(40.0); // Map [1, 10) to [50, 90)
-            ratio as u32
+            // 1–10 periods: scale 50–90 (integer arithmetic, no floats)
+            let scaled = (runway_periods - 1) * 444 / 100; // 4.44 per period
+            (50 + scaled.min(40)) as u32 // Map [1, 10) to [50, 90)
         } else {
-            90 + (((runway_periods - 10.0) / 10.0) * 10.0).min(10.0) as u32 // Map [10, ∞) to [90, 100]
+            // 10+ periods: scale 90–100
+            (90 + (runway_periods - 10).min(10)) as u32 // Map [10, ∞) to [90, 100]
         };
 
         // Apply low balance threshold penalty

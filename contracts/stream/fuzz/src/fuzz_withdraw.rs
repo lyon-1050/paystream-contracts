@@ -19,7 +19,7 @@
 //!   `deposit`.
 //! * The Exhausted transition triggers if and only if `withdrawn >= deposit`.
 
-#![allow(dead_code)]
+#![allow(unused_imports, dead_code)]
 
 use paystream_stream::storage::claimable_amount;
 use paystream_stream::types::{Stream, StreamStatus};
@@ -49,6 +49,7 @@ fn make_stream(
         stop_time,
         last_withdraw_time,
         status: StreamStatus::Active,
+        pending_accrual: 0,
         locked: false,
         low_balance_threshold: 0,
     }
@@ -152,6 +153,7 @@ proptest! {
                 stop_time: 0,
                 last_withdraw_time: 0,
                 status: StreamStatus::Exhausted,
+                pending_accrual: 0,
                 locked: false,
                 low_balance_threshold: 0,
             }

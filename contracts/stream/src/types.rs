@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// The `soroban-sdk` `contracttype` macro generates a public `spec_xdr`
+// associated function without documentation, which the `missing_docs` lint
+// rejects.
+#![allow(missing_docs)]
+
 use soroban_sdk::{contracttype, Address};
 
 /// Status of a salary stream.
@@ -93,8 +98,10 @@ pub struct StreamParams {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SplitBeneficiary {
+    /// Address that receives the share of the stream.
     pub address: Address,
-    pub basis_points: u32,  // 0-10000, where 10000 = 100%
+    /// Share of the stream in basis points (0-10000, where 10000 = 100%).
+    pub basis_points: u32,
 }
 
 /// Configuration for recurring stream auto top-up.
@@ -119,7 +126,7 @@ pub struct AutoTopupConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolFeeConfig {
     /// Fee in basis points (100 bps = 1%). Must not exceed 100.
-    pub fee_bps: u16,
+    pub fee_bps: u32,
     /// Address that receives the protocol fee.
     pub treasury: Address,
 }
@@ -128,7 +135,9 @@ pub struct ProtocolFeeConfig {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PendingUpgrade {
+    /// WASM hash the contract will be upgraded to.
     pub wasm_hash: soroban_sdk::BytesN<32>,
+    /// Ledger timestamp from which the upgrade may be executed.
     pub unlock_time: u64,
 }
 
@@ -191,6 +200,11 @@ pub enum DataKey {
     StreamEndedAt(u64),
     /// Maximum number of streams a single employer may create per ledger.
     MaxCreatesPerLedger,
+    /// Pending upgrade proposal (WASM hash + unlock time) for the time-lock
+    /// upgrade mechanism (SEC-02).
+    PendingUpgrade,
+    /// Beneficiary split of a split stream: stream ID → Vec<SplitBeneficiary>.
+    SplitBeneficiaries(u64),
     /// Ledger sequence number in which the employer last created a stream.
     LastCreateLedger(Address),
     /// Number of streams the employer created in the current ledger.
@@ -283,7 +297,8 @@ pub const ERR_DRAIN_NOT_PAUSED: &str = "E026: contract must be paused before eme
 /// E027: no pending emergency drain proposal exists (SEC-03 / #32).
 pub const ERR_NO_PENDING_DRAIN: &str = "E027: no pending emergency drain proposal";
 /// E028: new_employer must differ from the stream's employee.
-pub const ERR_NEW_EMPLOYER_IS_EMPLOYEE: &str = "E028: new_employer must differ from the stream employee";
+pub const ERR_NEW_EMPLOYER_IS_EMPLOYEE: &str =
+    "E028: new_employer must differ from the stream employee";
 /// Error returned when a batch exceeds the maximum size.
 pub const ERR_BATCH_TOO_LARGE: &str = "E029: batch exceeds the maximum of 50 streams";
 /// E025: the auto top-up parameters are invalid.
@@ -304,6 +319,7 @@ pub const MAX_SPLIT_BENEFICIARIES: u32 = 20;
 pub const ERR_NOT_RECEIPT_OWNER: &str = "E030: caller does not hold the stream receipt";
 /// E031: template not found.
 pub const ERR_TEMPLATE_NOT_FOUND: &str = "E031: template not found";
+/// Maximum number of streams in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
 
 /// E030: stop_time extends beyond 10-year limit from now

@@ -7,7 +7,7 @@
 //! (E001-E022). Unexpected panics (e.g. from integer overflow or an
 //! undocumented assertion) would indicate a contract bug.
 
-#![allow(dead_code)]
+#![allow(unused_imports, dead_code)]
 
 use paystream_stream::validate::validate_create_stream;
 use proptest::prelude::*;

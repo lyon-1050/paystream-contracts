@@ -13,7 +13,7 @@ use crate::storage::{
     get_pending_admin, has_admin, set_admin, set_allowance, set_balance, set_pending_admin,
     set_total_supply, total_supply,
 };
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, Address, BytesN, ContractExecutable, Env};
 
 /// T001: token arithmetic overflow.
 const ERR_OVERFLOW: &str = "T001: token arithmetic overflow";
@@ -197,7 +197,8 @@ impl TokenContract {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, nonce: u64) {
         get_admin(&env).require_auth();
         consume_admin_nonce(&env, nonce);
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer()
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash));
     }
 
     /// Post-upgrade migration hook. Currently a no-op beyond admin verification.

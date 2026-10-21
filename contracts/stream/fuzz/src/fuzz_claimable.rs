@@ -30,6 +30,7 @@ fn make_stream(
         stop_time,
         last_withdraw_time,
         status,
+        pending_accrual: 0,
         locked: false,
         low_balance_threshold: 0,
     }

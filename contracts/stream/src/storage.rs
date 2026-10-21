@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![deny(missing_docs)]
+
 use crate::types::{
-    AutoTopupConfig, DataKey, DEFAULT_MAX_CREATES_PER_LEDGER, ERR_ADMIN_NOT_SET, ERR_BAD_NONCE,
-    ERR_OVERFLOW, ERR_RATE_LIMIT_EXCEEDED, LinearVestSchedule, PendingUpgrade, ProtocolFeeConfig,
-    Stream, StreamParams, StreamStatus, StreamType,
+    AutoTopupConfig, DataKey, LinearVestSchedule, PendingUpgrade, ProtocolFeeConfig,
+    SplitBeneficiary, Stream, StreamParams, StreamStatus, StreamType,
+    DEFAULT_MAX_CREATES_PER_LEDGER, ERR_ADMIN_NOT_SET, ERR_BAD_NONCE, ERR_OVERFLOW,
+    ERR_RATE_LIMIT_EXCEEDED,
 };
 use soroban_sdk::{Address, Env, Vec};
 
@@ -98,7 +101,9 @@ pub fn get_max_creates_per_ledger(env: &Env) -> u32 {
 
 /// Store the maximum number of streams an employer may create per ledger.
 pub fn store_max_creates(env: &Env, max: u32) {
-    env.storage().instance().set(&DataKey::MaxCreatesPerLedger, &max);
+    env.storage()
+        .instance()
+        .set(&DataKey::MaxCreatesPerLedger, &max);
 }
 
 /// Count `count` new stream creations against the employer's per-ledger cap.
@@ -126,14 +131,19 @@ pub fn check_and_increment_create_rate(env: &Env, employer: &Address, count: u32
         .unwrap_or(0);
 
     // A new ledger resets the per-ledger budget.
-    let created_in_ledger = if last_ledger == current_ledger { created } else { 0 };
+    let created_in_ledger = if last_ledger == current_ledger {
+        created
+    } else {
+        0
+    };
     let updated = created_in_ledger + count;
 
     assert!(updated <= max, "{}", ERR_RATE_LIMIT_EXCEEDED);
 
-    env.storage()
-        .temporary()
-        .set(&DataKey::LastCreateLedger(employer.clone()), &current_ledger);
+    env.storage().temporary().set(
+        &DataKey::LastCreateLedger(employer.clone()),
+        &current_ledger,
+    );
     env.storage()
         .temporary()
         .set(&DataKey::CreateCountThisLedger(employer.clone()), &updated);
@@ -188,17 +198,13 @@ pub fn set_pending_admin_nonce(env: &Env, nonce: u64) {
 
 /// Return the nonce bound to the pending administrator proposal.
 pub fn get_pending_admin_nonce(env: &Env) -> Option<u64> {
-    env.storage()
-        .instance()
-        .get(&DataKey::PendingAdminNonce)
+    env.storage().instance().get(&DataKey::PendingAdminNonce)
 }
 
 /// Clear the pending administrator and its associated nonce.
 pub fn clear_pending_admin(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingAdmin);
-    env.storage()
-        .instance()
-        .remove(&DataKey::PendingAdminNonce);
+    env.storage().instance().remove(&DataKey::PendingAdminNonce);
 }
 
 /// Return the configured minimum deposit, or the default when unset.
@@ -215,7 +221,7 @@ pub fn set_min_deposit(env: &Env, amount: i128) {
 }
 
 /// Return the configured fee and treasury, or `(0, None)` when unset.
-pub fn get_protocol_fee(env: &Env) -> (u16, Option<Address>) {
+pub fn get_protocol_fee(env: &Env) -> (u32, Option<Address>) {
     match env
         .storage()
         .instance()
@@ -227,7 +233,7 @@ pub fn get_protocol_fee(env: &Env) -> (u16, Option<Address>) {
 }
 
 /// Store the configured protocol fee and treasury address.
-pub fn set_protocol_fee(env: &Env, fee_bps: u16, treasury: &Address) {
+pub fn set_protocol_fee(env: &Env, fee_bps: u32, treasury: &Address) {
     env.storage().instance().set(
         &DataKey::ProtocolFee,
         &ProtocolFeeConfig {
@@ -235,6 +241,27 @@ pub fn set_protocol_fee(env: &Env, fee_bps: u16, treasury: &Address) {
             treasury: treasury.clone(),
         },
     );
+}
+
+/// Store the beneficiary split of a split stream.
+pub fn set_split_beneficiaries(env: &Env, stream_id: u64, beneficiaries: &Vec<SplitBeneficiary>) {
+    let key = DataKey::SplitBeneficiaries(stream_id);
+    env.storage().persistent().set(&key, beneficiaries);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Return the beneficiary split of a split stream, if any.
+pub fn get_split_beneficiaries(env: &Env, stream_id: u64) -> Option<Vec<SplitBeneficiary>> {
+    let key = DataKey::SplitBeneficiaries(stream_id);
+    let beneficiaries: Option<Vec<SplitBeneficiary>> = env.storage().persistent().get(&key);
+    if beneficiaries.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+    beneficiaries
 }
 
 /// Return a stream's type, defaulting to `Payroll` for legacy streams.
@@ -355,10 +382,7 @@ pub fn linear_vest_claimable_amount(
     let remainder = (schedule.total_grant % vest_period) as u128;
     let fraction = (remainder * elapsed as u128 / schedule.vest_period as u128) as i128;
     let vested = whole.checked_add(fraction).expect(ERR_OVERFLOW);
-    let unwithdrawn_grant = vested
-        .checked_sub(stream.withdrawn)
-        .unwrap_or(0)
-        .max(0);
+    let unwithdrawn_grant = vested.checked_sub(stream.withdrawn).unwrap_or(0).max(0);
     let remaining = stream
         .deposit
         .checked_sub(stream.withdrawn)
@@ -498,6 +522,7 @@ pub fn get_token_streams(env: &Env, token: &Address) -> Vec<u64> {
     ids
 }
 
+/// Return the auto top-up configuration of a stream, if any.
 pub fn get_auto_topup(env: &Env, stream_id: u64) -> Option<AutoTopupConfig> {
     let key = DataKey::AutoTopup(stream_id);
     let config: Option<AutoTopupConfig> = env.storage().persistent().get(&key);
